@@ -1,5 +1,8 @@
 # WhateverXe
 
+> **GU603 向け実験的開発ブランチです。** upstream 0.7.0 をベースとしており、最新版ではありません。[対象範囲と制限](docs/gu603-experimental.md)を参照してください。GU603 向けの安定版リリースではありません。
+
+
 [English](README.md)
 
 WhateverXeは、WhateverGreenを基に開発した、一部のIntel Xe-LP内蔵GPU向けにAppleのグラフィックスドライバーを適応させるLiluプラグインです。

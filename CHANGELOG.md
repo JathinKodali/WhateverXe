@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0-gu603-experimental
+
+- Preserve the local GU603 graphics experiments on the upstream 0.7.0 source baseline.
+- Add narrowly scoped GU603 profile, internal-panel, clock, backlight and unavailable-media-engine handling.
+- Retain experimental status; no broad hardware or OS compatibility claim.
+- Package the existing GU603 policy regression tests for reproducible CPU-only validation.
+
 ## 0.7.0
 
 Use the latest [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) package with this update.

@@ -1,5 +1,8 @@
 # WhateverXe
 
+> **Experimental GU603 development branch.** Based on upstream 0.7.0; not the latest upstream release. See [scope and limitations](docs/gu603-experimental.md). No stable GU603 release is claimed.
+
+
 [日本語](README_ja.md)
 
 WhateverXe is a Lilu plugin, derived from WhateverGreen, that adapts Apple graphics drivers for selected Intel Xe-LP integrated GPUs.

@@ -20,6 +20,10 @@ assert s.count('xelpInstallNVRAMABI(patcher,index,address,size)')==1
 assert s.count('processFramebufferDonorRuntime(patcher,index,address,size)')==1
 code=r'''
 #include <cassert>
+// GU603 diagnostic checkpoints do not change the exercised start contract.
+bool checkKernelArgument(const char*) { return false; }
+#define IOLog(...) ((void)0)
+#define os_log(...) ((void)0)
 #include "kern_xelp_combo_clock.hpp"
 struct {void *lock=(void*)1;XELPComboClock::ClockAllocation allocation;} comboClockTransaction;
 #include <cstdint>

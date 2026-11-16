@@ -114,6 +114,13 @@ private:
  static uint32_t wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void *timing);
  static uint32_t wrapADLSPanelBacklight(void *controller,uint32_t brightness);
  static void wrapADLSPanelPWMEnable(void *access);
+ // GU603 trial12/13: handle the 'bklt' attribute before Apple's unsupported-gate.
+ // The getter hook makes AppleIntelPanelA::setDisplay select this framebuffer; the
+ // setter hook programs the PWM duty.
+ mach_vm_address_t orgGU603SetAttribute {},orgGU603GetAttribute {};
+ bool gu603AttributeReady {};
+ static uint32_t wrapGU603SetAttribute(void *fb,int32_t connectIndex,uint32_t attribute,uintptr_t value);
+ static uint32_t wrapGU603GetAttribute(void *fb,int32_t connectIndex,uint32_t attribute,uintptr_t *value);
     mach_vm_address_t orgADLSPowerPG {};
     static uint8_t *adlsPowerTarget(void *power);
     static void wrapADLSPowerPG(void *power,bool enable,uint32_t requested);
@@ -199,6 +206,9 @@ private:
  static uint32_t wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag);
  static uint32_t wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag);
  mach_vm_address_t orgDisplay13TrainingPattern {},orgDisplay13SignalLevels {};
+ mach_vm_address_t orgGU603EDPRegs {};
+ static bool wrapGU603EDPRegs(void *,void *,void *,void *,const void *,void *);
+
  mach_vm_address_t orgDisplay13EnablePort {},orgDisplay13DisablePort {};
  static bool display13MainLinkAUX(void *port,bool acquire,bool stopping=false);
  static uint32_t wrapDisplay13EnablePort(void *port);

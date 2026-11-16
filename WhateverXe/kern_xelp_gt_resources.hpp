@@ -39,13 +39,18 @@ inline bool decodeSmallGT(const uint32_t *fuses, SmallGTResources &out) {
 // ADL-P Gen12.3 retains the Xe-LP fuse encoding, with up to six DSS and
 // eight L3 banks. Capacity comes from fuses rather than a CPU/board model.
 // The donor URB backend handles 4/6/8 banks; reject unsupported capacities.
+// Experimental GU603VV capture: 64 EU, six L3 banks, VCS2 and VECS0.
+// Keep the physical media fuse; the donor selects its surviving engines.
+inline bool isGU603VVProfile(const uint32_t *f) {
+    return f && f[0]==1 && f[1]==0xF && f[2]==0 && f[3]==0x44 && f[4]==0x000E00FB;
+}
 inline bool decodeADLPGT(const uint32_t *fuses, GTResources &out) {
     out={};
     if(!fuses)return false;
     for(unsigned i=0;i<5;++i)if(fuses[i]==UINT32_MAX)return false;
     const auto slice=fuses[0]&0xFF,mask=fuses[1]&0x3F;
     const auto video=(~fuses[4])&0xFF,enhance=((~fuses[4])>>16)&0xF;
-    if(slice!=1 || !mask || (video!=1 && video!=5) || enhance!=1)return false;
+    if(slice!=1 || !mask || (video!=1 && video!=5 && !isGU603VVProfile(fuses)) || enhance!=1)return false;
     const auto dss=static_cast<uint32_t>(__builtin_popcount(mask));
     const auto perDSS=2*(8-static_cast<uint32_t>(__builtin_popcount(fuses[2]&0xFF)));
     const auto banks=8-static_cast<uint32_t>(__builtin_popcount(fuses[3]&0xFF));

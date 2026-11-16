@@ -244,6 +244,7 @@ struct Snapshot {
     uint64_t pipePixelHz {};
     unsigned pipeIndex {}; // Display pipe, not physical HDMI DDI or framebuffer index.
     Display13Transcoder::Bindings transcoders;
+    bool twoPixelsPerClock {}; // Explicitly qualified Display 13 panel trial.
 };
 // FlushTriggerPackets writes these native packets in append order. A flip
 // queued after WM enable may supersede the surface sampled at enable time.
@@ -287,11 +288,17 @@ inline TriggerSurfaces triggerSurfaces(const TriggerPacket *packets,uint32_t cou
 // CDCLK. An unchanged hardware-verified plan is valid at another clock when
 // every consumer still fits its bandwidth. A clock request alone is no proof.
 inline bool clockFits(const Snapshot &s,uint64_t nativeHz) {
+    // Linux v6.12 intel_cdclk.c:intel_pixel_rate_to_cdclk and
+    // skl_universal_plane.c:icl_plane_min_cdclk use ceil(pixel_rate / 2).
+    // The donor ABI already reports 2*CDCLK. Dividing it by two again
+    // rejects valid Display 13 scanout. Preserve legacy policy unless the
+    // caller qualifies the trial; no clock writes or fabricated latch proof.
+    const auto limit=s.twoPixelsPerClock ? (nativeHz/2)*2 : nativeHz/2;
     return s.primary && s.primary->status==Status::Complete && nativeHz &&
-        s.primary->pixelHz && s.primary->pixelHz<=nativeHz/2 && s.pipePixelHz &&
-        s.pipePixelHz<=nativeHz/2 && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
+        s.primary->pixelHz && s.primary->pixelHz<=limit && s.pipePixelHz &&
+        s.pipePixelHz<=limit && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
         (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete &&
-            s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz/2));
+            s.cursor->pixelHz && s.cursor->pixelHz<=limit));
 }
 enum class LatchCheck : uint32_t {None,Controls,OtherPlane,DSB,Clock,Registers,Live,Frame,AwaitingScanout,AwaitingFlip};
 struct Latch {

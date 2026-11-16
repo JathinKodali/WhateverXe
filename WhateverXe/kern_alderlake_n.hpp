@@ -239,8 +239,12 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
     // payload-allocation bit. Firmware may leave bit8 set on an SST GOP;
     // preserve it and include it in the unchanged-source check, never clear it
     // on an enabled transcoder or infer an MST transport from that bit alone.
+    // Preserve the exact GU603VV firmware's CTL2 value; never clear it.
+    // The existing unchanged-source check still compares the full register.
+    const bool gu603Panel = panel && pipe==0 && ddi==0 && ctl2==8 &&
+        trans==0x8A000106U && tp==0x80040300U && buf==0x80000006U && clock==0x10000000U;
     return (trans&0xFF700000U)==(0x82000000U|((ddi+1)<<27)) &&
-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+        !(trans&((1U<<15)|(1U<<9))) && (!ctl2 || gu603Panel) &&
         (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
         (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
             (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&

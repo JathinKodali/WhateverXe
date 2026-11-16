@@ -13,11 +13,13 @@ code=r'''
 #include "kern_display13_firmware.hpp"
 #include "kern_display13_fb_topology.hpp"
 #include "kern_alderlake_s.hpp"
-bool adopt=false,hdmiTrial=false;
-bool checkKernelArgument(const char *s){return !strcmp(s,"-wex-dsi-adopt")?adopt:!strcmp(s,"-wex-dsi-hdmi-test")?hdmiTrial:false;}
+#include "gu603_internal_panel.hpp"
+#define os_log(...) ((void)0)
+bool adopt=false,hdmiTrial=false,internalOnly=false;
+bool checkKernelArgument(const char *s){return !strcmp(s,"-wex-gu603-internal-only")?internalOnly:!strcmp(s,"-wex-dsi-adopt")?adopt:!strcmp(s,"-wex-dsi-hdmi-test")?hdmiTrial:false;}
 struct OSData {void *data=nullptr;unsigned bytes=0;void *getBytesNoCopy(){return data;}unsigned getLength(){return bytes;}};
 #define OSDynamicCast(T,p) static_cast<T *>(p)
-struct IOService {OSData *property=nullptr;OSData *getProperty(const char *){return property;}};
+struct IOService {OSData *property=nullptr;OSData *getProperty(const char *){return property;}template<class...T>void setProperty(T...) {}};
 struct IORegistryEntry {static IORegistryEntry *getRegistryRoot(){static IORegistryEntry r;return &r;}void setProperty(const char*,bool){}};
 XELP::ProbeConfig seen;unsigned calls=0;
 bool configure(void *c,const XELP::ProbeConfig *p){assert(c==(void*)1);seen=*p;++calls;return p->valid();}
@@ -41,6 +43,23 @@ struct XE {
 };
 FUNCTIONS
 int main(){
+ // Exercise the production selector, not only the isolated policy helper.
+ XE gu;IOService guPCI;gu.xeProfile=XELP::identify(0xA7A88086,4);
+ auto &v=gu.firmwarePorts;v.status=XELP::VBT::Status::Valid;v.present=0x19;
+ v.port[0]={0x78C6,10,0,0x40,0,0};
+ v.panel.valid=v.panel.backlightValid=v.panel.pwmPresent=true;
+ v.panel.ddi=0;v.panel.backlightType=2;
+ for(unsigned d:{3U,4U}) {v.port[d].type=0x60d6;v.port[d].aux=(d+3)*0x10;v.port[d].capabilities=3;}
+ auto guBoard=gu.display13BoardWiring(&guPCI);
+ assert(guBoard.panel==1 && guBoard.dp==0x18 && guBoard.selected()==0x19);
+ internalOnly=true;guBoard=gu.display13BoardWiring(&guPCI);
+ assert(guBoard.panel==1 && guBoard.selected()==1 && !guBoard.dp && !guBoard.typeC);
+ assert(Display13FBTopology::singleOutputWiring(guBoard));
+ gu.xeProfile=XELP::identify(0xA7A88086,5);
+ assert(gu.display13BoardWiring(&guPCI).selected()==0x19);
+ gu.xeProfile=XELP::identify(0x46A68086,12);
+ assert(gu.display13BoardWiring(&guPCI).selected()==0x19);
+ internalOnly=false;
  XE dsi;dsi.adlnOutputWiring.valid=true;dsi.adlnOutputWiring.dsi=1;
  dsi.adlnOutputWiring.hdmi=2;dsi.adlnOutputWiring.ddc[1]=2;
  assert(!dsi.xelpBindProbe((void*)1));dsi.dsiResourcesReady=true;

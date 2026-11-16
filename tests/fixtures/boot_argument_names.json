@@ -147,5 +147,14 @@
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],
-  "-wex-dsi-power-test": []
+  "-wex-dsi-power-test": [],
+  "-wex-gu603-wakefix": [],
+  "-wex-gu603-infofix": [],
+  "-wex-gu603-pavpfix": [],
+  "-wex-gu603-edpkeep": [],
+  "-wex-gu603-panelclock": [],
+  "-wex-gu603-internal-only": [],
+  "-wex-gu603-media-guard": [],
+  "-wex-gu603-wmclock": [],
+  "-wex-gu603-blfix": []
 }

@@ -19,6 +19,7 @@ code=r'''
 #include "kern_alderlake_s.hpp"
 #include "kern_xelp_panel_pwm.hpp"
 #include "kern_tgl_tc_native.hpp"
+#include "gu603_backlight.hpp"
 #include <cassert>
 #include <cstdio>
 #include <fstream>
@@ -27,6 +28,8 @@ code=r'''
 #include <sys/mman.h>
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
 constexpr uint32_t kIOReturnNotReady=0xe00002d8;
+// The production wrappers also carry the opt-in GU603 backlight path; the flag is off here.
+static bool checkKernelArgument(const char*){return false;}
 struct IORegistryEntry {static IORegistryEntry* getRegistryRoot(){static IORegistryEntry o;return &o;}void setProperty(const char*,bool){}};
 struct KernelPatcher {
  enum class Error{NoError,Failed};bool fail=false;unsigned routes=0,blocks=0;uintptr_t delta=0;
@@ -47,7 +50,7 @@ struct XE {
 
  bool adlsDisplaySelected=true,adlsPanelPWMReady=true,tglActive=true;XELP::PanelPWM adlsPanelPWM;
  XELP::VBT::Ports firmwarePorts;AlderLakeS::Wiring adlsWiring;
- struct {XELP::Family family=XELP::Family::AlderLakeS;}xeProfile;
+ struct {XELP::Family family=XELP::Family::AlderLakeS;uint32_t identity=0,revision=0;}xeProfile;
  TGLTCNativeFunctions tglTCNativeFunctions;void*tglObservationController=nullptr;
  uint64_t tglPlatformCopy[0x1c0/8]{};
  uintptr_t orgTGLRegisterRead=0,orgTGLRegisterWrite=0,orgADLSLightUpEDP=0,orgADLSPanelBacklight=0;

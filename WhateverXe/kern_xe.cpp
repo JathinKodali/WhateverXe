@@ -11,6 +11,16 @@
 #include "kern_dsi_native_backing.hpp"
 #include "kern_dsi_native_mode.hpp"
 #include "kern_xe.hpp"
+#include "gu603_wake_scope.hpp"
+#include "gu603_info_patch.hpp"
+#include "gu603_pavp_guard.hpp"
+#include "gu603_edp_keep.hpp"
+#include "gu603_panel_clock.hpp"
+#include "gu603_internal_panel.hpp"
+#include "gu603_media_guard.hpp"
+#include "gu603_wm_clock.hpp"
+#include "gu603_backlight.hpp"
+#include <os/log.h>
 #include "kern_framebuffer_donor.hpp"
 #include "kern_xelp_os.hpp"
 #include "kern_xelp_call_target.hpp"
@@ -97,6 +107,51 @@
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
 
+// USB-only GU603VV startup trial. This describes the existing configure lease;
+// it never adds a second lifetime or releases another owner's request.
+struct GU603ConfigureWake {
+ IOService *owner {};uintptr_t thread {};volatile uint8_t *base {};uint64_t physical {};
+ uint32_t baseline[2] {};bool active {},failed {};unsigned observations {};
+};
+static GU603ConfigureWake gu603ConfigureWake;
+static uintptr_t gu603GPUInfoWakeCaller;
+static uintptr_t gu603GPUInfoWakeReleaseCaller;
+static bool gu603CapturedProfile;
+static mach_vm_address_t gu603NativeCapsOriginal;
+static bool gu603NativeCaps(IOService *owner) {
+ auto a=reinterpret_cast<uint8_t *>(owner);
+ os_log(OS_LOG_DEFAULT,"GU603 trial8 caps entered sku=%u EU=%u SS=%u L3=%u\n",
+    Display13FBMemory::field<uint32_t>(a,0x1120),Display13FBMemory::field<uint32_t>(a,0x1124),
+    Display13FBMemory::field<uint32_t>(a,0x1158),Display13FBMemory::field<uint32_t>(a,0x1164));
+ const bool result=reinterpret_cast<bool (*)(IOService *)>(gu603NativeCapsOriginal)(owner);
+ os_log(OS_LOG_DEFAULT,"GU603 trial8 caps returned=%u\n",result);
+ return result;
+}
+
+
+static mach_vm_address_t gu603PAVPOriginal;
+static uintptr_t gu603PAVPDiscoveryCaller;
+static uint32_t gu603PAVPReports;
+static IOReturn gu603PAVPCallback(IOService *owner,int32_t command,uint32_t app,uint32_t *data,bool flag) {
+    const bool requested=checkKernelArgument("-wex-gu603-pavpfix");
+    if(requested && gu603CapturedProfile && owner && owner->getMetaClass()->getClassSize()>=0x1400) {
+        auto pci=OSDynamicCast(IOPCIDevice,owner->getProvider());
+        auto a=reinterpret_cast<uint8_t *>(owner);
+        const auto context=Display13FBMemory::field<uintptr_t>(a,0x1278);
+        const auto engines=Display13FBMemory::field<uint64_t>(a,0x1300);
+        if(pci && GU603PAVP::unavailable(requested,gu603CapturedProfile,pci->configRead32(0),
+                                       pci->configRead8(8),engines,context,command)) {
+            owner->setProperty("GU603PAVPUnavailable",true);
+            if(__atomic_add_fetch(&gu603PAVPReports,1U,__ATOMIC_RELAXED)<=8)
+                os_log(OS_LOG_DEFAULT,"GU603 trial8 PAVP command=%d startup=%u engines=%llx context=0: returning NoDevice\n",
+                    command,reinterpret_cast<uintptr_t>(__builtin_return_address(0))==gu603PAVPDiscoveryCaller,engines);
+            return kIOReturnNoDevice;
+        }
+    }
+    return reinterpret_cast<IOReturn (*)(IOService *,int32_t,uint32_t,uint32_t *,bool)>(gu603PAVPOriginal)(owner,command,app,data,flag);
+}
+
+static void gu603ObserveAfterWake(void *,bool,unsigned,uintptr_t);
 extern "C" const char version[];
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
 extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
@@ -719,8 +774,31 @@ static uint64_t adlnRuntimeRCSReceipt[4+8*12] {1,8,12,0};
 static bool adlnNativeRCSProfileReady;
 // Selected once from the admitted backend; the explicit context trial stays separate.
 static bool adlnNativeRCSProfileRequested;
+static bool gu603MediaGuardReady;
+static uintptr_t gu603MediaCaller,gu603MediaParams;
+static uint32_t gu603MediaRejected;
 static OSObject *adlnInitialRCSFactory(void *task,const void *params,uint8_t options) {
  const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+ if(gu603MediaGuardReady && caller==gu603MediaCaller &&
+    reinterpret_cast<uintptr_t>(params)==gu603MediaParams && task && tglHost.owner) {
+  auto owner=static_cast<IOService *>(tglHost.owner);
+  auto taskObject=static_cast<OSObject *>(task);
+  if(owner->getMetaClass()->getClassSize()>=0x1400 && taskObject->getMetaClass()->getClassSize()>=0x18) {
+   auto pci=OSDynamicCast(IOPCIDevice,owner->getProvider());
+   const bool scoped=pci && GU603Media::scope(checkKernelArgument("-wex-gu603-media-guard"),
+       gu603CapturedProfile,pci->configRead32(0),pci->configRead8(8));
+   const auto engines=Display13FBMemory::field<uint64_t>(owner,0x1300);
+   if(GU603Media::reject(scoped,gu603MediaGuardReady,true,true,
+      Display13FBMemory::field<void *>(task,0x10)==owner,options,engines)) {
+    const auto count=__atomic_add_fetch(&gu603MediaRejected,1U,__ATOMIC_RELAXED);
+    owner->setProperty("GU603UnavailableVCS0Requests",count,32);
+    if(count<=8)os_log(OS_LOG_DEFAULT,"GU603 trial8 video VCS0 unavailable engines=%llx count=%u: refusing context",engines,count);
+    // The byte-verified media caller handles NULL and returns its native
+    // failure value. No allocation, fake completion, queue binding or MMIO.
+    return nullptr;
+   }
+  }
+ }
  const bool initial=caller==adlnInitialRCSCallers[0] || caller==adlnInitialRCSCallers[1];
  const bool runtime=(checkKernelArgument("-wex-adln-rcs-no-pocs") || adlnNativeRCSProfileRequested) && caller==adlnRuntimeRCSCaller;
  if(initial && (reinterpret_cast<uintptr_t>(params)!=adlnInitialRCSParams || options!=2 ||
@@ -1068,12 +1146,27 @@ static __attribute__((noinline)) void adlnPrepareRCSProfile(KernelPatcher &patch
     if(ready) {adlnRuntimeRCSCaller=address+0x2FD88;adlnRuntimeRCSParams=address+0xB0BC0;}
     IORegistryEntry::getRegistryRoot()->setProperty("N97RuntimeRCSNoPOCSReady",ready);
    }
+   const bool mediaTrial=checkKernelArgument("-wex-gu603-media-guard") && gu603CapturedProfile;
+   if(mediaTrial) {
+    namespace M=GU603Media;
+    ready=ready && size>M::ParamsOffset+sizeof(M::Params) &&
+     patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGAccelVideoContextMedia18processDataBuffersEj",address,size)==address+M::ProcessOffset &&
+     !memcmp(reinterpret_cast<void *>(address+M::ParamsOffset),M::Params,sizeof(M::Params)) &&
+     !memcmp(reinterpret_cast<void *>(address+M::CallOffset),M::Call,sizeof(M::Call)) &&
+     !memcmp(reinterpret_cast<void *>(address+M::CallerOffset),M::Return,sizeof(M::Return)) &&
+     !memcmp(reinterpret_cast<void *>(address+M::FailureOffset),M::Failure,sizeof(M::Failure)) &&
+     !memcmp(reinterpret_cast<void *>(address+M::BindOffset),M::Bind,sizeof(M::Bind)) &&
+     !memcmp(reinterpret_cast<void *>(address+M::FaultOffset),M::Fault,sizeof(M::Fault));
+    if(ready) {gu603MediaCaller=address+M::CallerOffset;gu603MediaParams=address+M::ParamsOffset;}
+   }
    if(ready) {
     adlnInitialRCSCallers[0]=address+0x25DA6;adlnInitialRCSCallers[1]=address+0x25DCA;
     adlnInitialRCSParams=address+0xB09A4;adlnInitialRCSGLParams=address+0xBF350;
     KernelPatcher::RouteRequest route[] {{symbols[0],adlnInitialRCSFactory,adlnInitialRCSFactoryOriginal}};
     ready=patcher.routeMultiple(index,route,arrsize(route),address,size);
    }
+   gu603MediaGuardReady=mediaTrial && ready;
+   if(mediaTrial)IORegistryEntry::getRegistryRoot()->setProperty("GU603MediaGuardReady",gu603MediaGuardReady);
    IORegistryEntry::getRegistryRoot()->setProperty("N97InitialRCSNoPOCSReady",ready);
   }
   if(normalProfile || checkKernelArgument("-wex-adln-kernel-reuse")) {
@@ -3912,6 +4005,16 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
         IORegistryEntry::getRegistryRoot()->setProperty("WEXDSIPanelOnly",dsiPanelOnly);
         if(!board.described())return {};
     }
+    const bool isolate=checkKernelArgument("-wex-gu603-internal-only");
+    const auto original=board.selected();
+    const bool isolated=GU603InternalPanel::select(isolate,xeProfile.identity,
+        xeProfile.revision,property!=nullptr,board);
+    if(isolate) {
+        uint32_t record[]={1,xeProfile.identity,xeProfile.revision,original,board.selected(),isolated};
+        provider->setProperty("GU603InternalPanelTrial",record,sizeof(record));
+        os_log(OS_LOG_DEFAULT,"GU603 trial8 wiring original=%x selected=%x isolated=%u",
+            original,board.selected(),isolated);
+    }
     return board;
 }
 
@@ -4184,6 +4287,12 @@ void XE::adlnBootstrap(IOPCIDevice *pci) {
 		uint32_t edram=UINT32_MAX;
 		auto gt=AlderLakeN::readGT(io,barReady && xelpMemoryMatches(pci),
 			adlnNativeRequested ? &edram : nullptr,adlpRenderRequested ? XELP::decodeADLPGT : nullptr);
+        // The captured VCS2-only trial is admitted on this physical SKU/step only.
+        if (XELP::isGU603VVProfile(gt.fuses) &&
+            (xeProfile.identity!=0xA7A88086U || xeProfile.revision!=4)) {
+            gt.resources={};gt.status=AlderLakeN::GTStatus::ProfileMismatch;
+        }
+
 		if (adlnNativeRequested) {
             adlnNativeSubslices=gt.resources.nativeSubslices; adlnL3Banks=gt.resources.l3Banks; adlnNativeEUs=gt.resources.eus;
             renderReady=gt.status==AlderLakeN::GTStatus::Complete && !(edram&1);
@@ -4191,6 +4300,10 @@ void XE::adlnBootstrap(IOPCIDevice *pci) {
 		}
 		pci->setProperty("N97GTReadout",&gt,sizeof(gt));
 		pci->setProperty("N97GTTopologyReady",gt.status==AlderLakeN::GTStatus::Complete);
+        pci->setProperty("WEXGU603Trial", XELP::isGU603VVProfile(gt.fuses));
+        gu603CapturedProfile=gt.status==AlderLakeN::GTStatus::Complete &&
+            XELP::isGU603VVProfile(gt.fuses) && xeProfile.identity==0xA7A88086U && xeProfile.revision==4;
+
 		SYSLOG("igfx", "AlderLakeN GT status=%u requested=%x released=%x failed=%x EU=%u banks=%u; engines unchanged",
 			static_cast<uint32_t>(gt.status),gt.requestedMask,gt.releasedMask,gt.releaseFailedMask,
 			gt.resources.eus,gt.resources.l3Banks);
@@ -4858,6 +4971,17 @@ static void adlnFault(bool &flag,uint32_t line,uint32_t status=UINT32_MAX) {
         r[26]=display13FBIRQ.handlers;r[27]=display13FBIRQ.quiescing;r[28]=c.bridge.begun;r[29]=c.bridge.state.suspended;
         r[30]=c.bridge.pgRefs[0];r[31]=c.bridge.pgRefs[2];
         IORegistryEntry::getRegistryRoot()->setProperty("N97FBFirstResourceFault",r,sizeof(r));
+        if(gu603CapturedProfile && checkKernelArgument("-wex-gu603-internal-only")) {
+            // Persist the first existing CPU-side fault record, without new
+            // hardware access, retries or pointers in the log.
+            os_log_error(OS_LOG_DEFAULT,"GU603 trial8 FIRST FAULT line=%u status=%x seq=%u bridge=%u memory=%u clock=%u dbuf=%u wm=%u",
+                line,status,c.sequence,c.bridge.state.faulted,c.memoryFaulted,
+                c.clockFaulted,c.dbuf.faulted,c.watermarkFaulted);
+            os_log_error(OS_LOG_DEFAULT,"GU603 trial8 FIRST STATE begun=%u adopted=%u engine=%u stopped=%u pending=%u consumers=%x unretired=%x updating=%u programming=%u committing=%u",
+                c.bridge.begun,c.bridge.bootAdopted,c.engineEnabled,c.clockStopped,
+                c.pipe[0].wmPending,c.dbuf.consumers,c.dbuf.unretired,c.dbuf.updating,
+                c.pipe[0].wmProgramming,c.pipe[0].wmCommitting);
+        }
     }
     flag=true;
 }
@@ -7539,6 +7663,24 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
   {disable,wrapDisplay13DisablePort,orgDisplay13DisablePort}
  };
  display13FBSSTHooksReady=patcher.routeMultiple(index,routes,arrsize(routes),address,size);patcher.clearError();
+ if(display13FBSSTHooksReady && checkKernelArgument("-wex-gu603-edpkeep") &&
+    xeProfile.identity==0xA7A88086U && xeProfile.revision==4) {
+    const char *symbol="__ZN31AppleIntelFramebufferController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE";
+    const char *setmode="__ZN31AppleIntelFramebufferController9hwSetModeEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2";
+    const auto entry=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
+    bool ready=size>GU603EDP::CallOffset+sizeof(GU603EDP::Call) && entry==address+GU603EDP::EntryOffset &&
+        patcher.solveSymbol<mach_vm_address_t>(index,setmode,address,size)==address+GU603EDP::SetModeOffset &&
+        !memcmp(reinterpret_cast<void *>(entry),GU603EDP::Entry,sizeof(GU603EDP::Entry)) &&
+        !memcmp(reinterpret_cast<void *>(address+GU603EDP::CallOffset),GU603EDP::Call,sizeof(GU603EDP::Call));
+    patcher.clearError();
+    if(ready) {
+        KernelPatcher::RouteRequest keep {symbol,wrapGU603EDPRegs,orgGU603EDPRegs};
+        ready=patcher.routeMultiple(index,&keep,1,address,size);patcher.clearError();
+    }
+    IORegistryEntry::getRegistryRoot()->setProperty("GU603EDPKeepRouted",ready);
+    os_log(OS_LOG_DEFAULT,"GU603 trial8 eDP keep hook ready=%u\n",ready);
+    display13FBSSTHooksReady=display13FBSSTHooksReady && ready;
+ }
  return display13FBSSTHooksReady;
 }
 
@@ -7553,9 +7695,66 @@ uint8_t *XE::display13SSTPort(void *port) {
  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
     !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
-    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) ||
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || (Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) && !(config[0]<2 && (s->adlnOutputWiring.panel&(1U<<config[0])) && !Display13FBMemory::field<uint32_t>(p,0x550))) ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
  return p;
+}
+
+// Same-image firmware-link adoption only. This wrapper does not read AUX,
+// edit EDID/caps, write MMIO or change the port's lane/rate/depth fields.
+struct GU603EDPRecord {
+ uint32_t version {1},call {},native {},kept {},reasons {},ddi {UINT32_MAX},pipe {UINT32_MAX},state {UINT32_MAX},lanes {},rate {};
+ GU603EDP::Live live {};GU603EDP::Wanted wanted {};
+};
+static uint32_t gu603EDPCalls;
+bool XE::wrapGU603EDPRegs(void *controller,void *rawFB,void *path,void *params,const void *timing,void *scaler) {
+ auto s=callbackXE;auto &c=display13FBPower;
+ const bool requested=checkKernelArgument("-wex-gu603-edpkeep") && gu603CapturedProfile;
+ uint32_t call=0;
+ if(requested){call=__atomic_add_fetch(&gu603EDPCalls,1U,__ATOMIC_RELAXED);if(call<=8)os_log(OS_LOG_DEFAULT,"GU603 trial8 eDP decision entered call=%u\n",call);}
+ const bool update=FunctionCast(wrapGU603EDPRegs,s->orgGU603EDPRegs)(controller,rawFB,path,params,timing,scaler);
+ if(!requested)return update;
+ if(!update || !c.lock || !path || !params || !rawFB) {
+    if(call<=8)os_log(OS_LOG_DEFAULT,"GU603 trial8 eDP native decision=%u call=%u\n",update,call);
+    return update;
+ }
+ namespace K=GU603EDP;
+ GU603EDPRecord r;r.call=call;r.native=update;r.wanted=K::wanted(params);
+ IOLockLock(c.lock);
+ auto object=static_cast<OSObject *>(path);void *port=nullptr;
+ if(object->getMetaClass()->getClassSize()>=0x3730) {
+    port=Display13FBMemory::field<void *>(path,0x3648);
+    r.pipe=Display13FBMemory::field<uint32_t>(path,0x3640);r.state=Display13FBMemory::field<uint32_t>(path,0x3644);
+ }
+ const auto p=port ? display13SSTPort(port) : nullptr;
+ if(p)r.ddi=Display13FBMemory::field<uint32_t>(p,0x120);
+ const auto binding=p ? adlnInspectPathBinding(static_cast<IOService *>(rawFB),object,s->adlnPlatform,s->adlnOutputWiring,false) : TGLFBBinding::Readout{};
+ if(!p || controller!=c.controller || r.ddi>=2 || !(s->adlnOutputWiring.panel&(1U<<r.ddi)) || r.pipe!=0 ||
+    binding.status!=TGLFBBinding::Status::Complete || binding.ddi!=r.ddi || binding.pipe!=0)r.reasons|=K::Target;
+ if(r.state!=2)r.reasons|=K::Attachment;
+ if(!(r.reasons&K::Target)) {
+    r.lanes=Display13FBMemory::field<uint32_t>(p,0x124);r.rate=Display13FBMemory::field<uint32_t>(p,0x128);
+    if(!c.bootPanel || !c.bridge.bootAdopted || c.bridge.bootPort!=r.ddi ||
+       c.bridge.bootPath!=reinterpret_cast<uintptr_t>(path))r.reasons|=K::Adoption;
+    Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
+    uint32_t v[9] {};bool readable=live.status==AlderLakeN::ReadoutStatus::Complete && live.activePipes==1;
+    for(unsigned i=0;readable && i<arrsize(K::Registers);++i)readable=AlderLakeN::value(live,K::Registers[i],v[i]);
+    if(!readable)r.reasons|=K::Readout;
+    else {
+        r.live.func=v[0];r.live.conf=v[1];r.live.source=v[8];
+        for(unsigned i=0;i<6;++i)r.live.timing[i]=v[i+2];
+        if(!AlderLakeN::dpSource(live,0,r.ddi,nullptr,true))r.reasons|=K::Source;
+        r.reasons|=K::compare(r.live,r.wanted,r.lanes);
+    }
+ }
+ IOLockUnlock(c.lock);
+ r.kept=!(r.reasons&K::Blocking);
+ auto registry=IORegistryEntry::getRegistryRoot();
+ if(call==1)registry->setProperty("GU603EDPKeepFirst",&r,sizeof(r));
+ registry->setProperty("GU603EDPKeepLast",&r,sizeof(r));
+ if(call<=8)os_log(OS_LOG_DEFAULT,"GU603 trial8 eDP keep=%u reasons=%x ddi=%u pipe=%u state=%u lanes=%u rate=%u live=%x want=%x src=%x/%x\n",
+    r.kept,r.reasons,r.ddi,r.pipe,r.state,r.lanes,r.rate,r.live.func,r.wanted.func,r.live.source,r.wanted.source);
+ return r.kept ? false : update;
 }
 
 bool XE::display13HDMIPort(void *port) {
@@ -8292,6 +8491,9 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 	if(s->tglObservationController==that)s->tglObservationController=nullptr;
 	if(!pci)return false;
     const auto board=s->display13BoardWiring(provider);
+    // Routing isolation is selected before the GT readout during bootstrap.
+    // Native startup still requires this machine's measured, admitted fuses.
+    if(checkKernelArgument("-wex-gu603-internal-only") && !gu603CapturedProfile)return false;
     if(!Display13FBTopology::supportedWiring(board,s->xeProfile.display==XELP::Display::XeLPD,checkKernelArgument("-wex-dsi-adopt")) ||
        board.selected()!=s->adlnOutputWiring.selected())return false;
     if(board.dsi) {
@@ -9053,11 +9255,43 @@ void XE::wrapAlderLakeNClockInit(IOService *controller) {
 	*reinterpret_cast<uint64_t *>(c+0xEA0)=r.nativeMaxHz();
 }
 uint64_t XE::wrapAlderLakeNClockProbe(IOService *controller) {return adlnClockReadout(controller).nativeHz();}
+static uint32_t gu603ClockCalls;
 void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
-	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {adlnSetDualClock(controller,nativeHz);return;}
 	auto &c=display13FBPower;if(!c.lock)return;
+	const bool multi=Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring);
+	const bool requested=checkKernelArgument("-wex-gu603-panelclock");
+	const bool trace=gu603CapturedProfile && checkKernelArgument("-wex-gu603-internal-only");
+	const uint32_t traceCall=trace ? __atomic_add_fetch(&gu603ClockCalls,1U,__ATOMIC_RELAXED) : 0;
+	if(traceCall && traceCall<=8)os_log(OS_LOG_DEFAULT,"GU603 trial8 clock entry call=%u multi=%u target=%llu",
+		traceCall,multi,nativeHz);
+	// Called only while c.lock is held. Retain the selected framebuffer across
+	// the native recursive mutex acquisition, then recheck topology and owner.
+	auto panelState=[&]() {
+		uint32_t frames=0,destroying=0;
+		for(unsigned p=0;p<3;++p) {
+			if(c.pipe[p].memoryFramebuffer)frames|=1U<<p;
+			if(c.pipe[p].destroyingPath)destroying|=1U<<p;
+		}
+		return GU603PanelClock::State{requested,gu603CapturedProfile,multi,
+			controller==c.controller && !c.memoryFaulted,
+			c.bootPanel && c.bridge.bootAdopted,
+			callbackXE->adlnOutputWiring.panel,c.bridge.bootPort,frames,destroying};
+	};
+	IOService *panelFB=nullptr;
+	if(multi && requested) {
+		IOLockLock(c.lock);
+		if(GU603PanelClock::eligible(panelState())) {
+			auto candidate=c.pipe[0].memoryFramebuffer;
+			if(candidate && candidate->getMetaClass()->getClassSize()>=0x4B90 &&
+				Display13FBMemory::field<IORecursiveLock *>(candidate,0x4220)) {
+				panelFB=candidate;panelFB->retain();
+			}
+		}
+		IOLockUnlock(c.lock);
+	}
+	if(multi && !panelFB) {adlnSetDualClock(controller,nativeHz);return;}
 	Display13Clock::Change result;result.requestedHz=nativeHz;
-	auto fb=c.pipe[0].memoryFramebuffer;
+	auto fb=panelFB ? panelFB : c.pipe[0].memoryFramebuffer;
 	auto mutex=fb && fb->getMetaClass()->getClassSize()>=0x4B90 ? Display13FBMemory::field<IORecursiveLock *>(fb,0x4220) : nullptr;
 	if(mutex)IORecursiveLockLock(mutex);
 	Display13WM::Latch beforeWM,afterWM;uint64_t wmRecord[6] {};
@@ -9070,6 +9304,9 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 			const auto trans=powerIO.read(0x60400+pipe*0x1000),conf=powerIO.read(0x70008+pipe*0x1000);
 			valid=valid && trans!=UINT32_MAX && conf!=UINT32_MAX;if((trans|conf)&(1U<<31))active|=1U<<pipe;
 		}
+		if(panelFB)valid=valid && GU603PanelClock::revalidated(panelState(),
+			panelFB==c.pipe[0].memoryFramebuffer,
+			mutex && mutex==Display13FBMemory::field<IORecursiveLock *>(panelFB,0x4220),active);
 		if(valid) {
 			Display13FBClockIO io {c.map};
 			Display13FBClockGuard guard;
@@ -9109,6 +9346,15 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 	IOLockUnlock(c.lock);if(mutex)IORecursiveLockUnlock(mutex);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBClockWM",wmRecord,sizeof(wmRecord));
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBClockChange",&result,sizeof(result));
+	if(traceCall && traceCall<=8)os_log(OS_LOG_DEFAULT,"GU603 trial8 clock return call=%u status=%u writes=%u actual=%llu wmBefore=%u wmAfter=%u",
+		traceCall,static_cast<unsigned>(result.status),result.writes,result.after.nativeHz(),
+		static_cast<unsigned>(beforeWM.status),static_cast<unsigned>(afterWM.status));
+	if(panelFB) {
+		IORegistryEntry::getRegistryRoot()->setProperty("GU603PanelOnlyClockChange",&result,sizeof(result));
+		if(traceCall && traceCall<=8)os_log(OS_LOG_DEFAULT,"GU603 trial8 panel clock target=%llu status=%u writes=%u actual=%llu\n",
+			nativeHz,static_cast<unsigned>(result.status),result.writes,result.after.nativeHz());
+		panelFB->release();
+	}
 }
 
 // A shared crawl needs real WM certificates for every active native pipe.
@@ -9670,11 +9916,20 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
     const auto primaryRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].primary);
     const auto cursorRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].cursor);
     if(primaryRaw==UINT32_MAX || cursorRaw==UINT32_MAX) {result.status=Display13WM::Status::Input;return result;}
+	const auto &wiring=callbackXE->adlnOutputWiring;
+	const bool twoPixels=GU603WMClock::eligible(checkKernelArgument("-wex-gu603-wmclock"),
+		gu603CapturedProfile,c.bridge.bootAdopted,c.bootPanel,wiring.valid,
+		wiring.selected(),wiring.panel,pipe,binding.ddi);
 	const Display13WM::Snapshot expected {
 		&c.pipe[pipe].wm[0],&c.pipe[pipe].wm[1],primaryRaw,cursorRaw,
 		c.pipe[pipe].wmSurface[0],c.pipe[pipe].wmSurface[1],readout.read(0x45004),nativeHz,c.pipe[pipe].wm0Only[0],cursor,
-		Display13WM::pipeLineTime(c.pipe[pipe].wm[0].htotal,pipePixel),pipePixel,pipe,c.transcoders
+		Display13WM::pipeLineTime(c.pipe[pipe].wm[0].htotal,pipePixel),pipePixel,pipe,c.transcoders,twoPixels
 	};
+	if(twoPixels) {
+		uint64_t record[] {1,pipe,c.pipe[pipe].wm[0].pixelHz,pipePixel,nativeHz,targetHz,
+			Display13WM::clockFits(expected,targetHz),cursor};
+		adlnPublishMemory("GU603WMClock",pipe,record,sizeof(record));
+	}
 	if(!Display13WM::clockFits(expected,targetHz)) {result.status=Display13WM::Status::Input;return result;}
 	return Display13WM::latch(io,expected);
 }
@@ -11336,8 +11591,62 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					{"__ZN16IntelAccelerator19initInterruptBridgeEv",wrapAlderLakeNNativeIRQ,orgAlderLakeNNativeIRQ}
 				};
 				const uintptr_t offsets[] {0x28422,0x2847E,0x24BC0};
+                if(adlnObserved)gu603GPUInfoWakeCaller=address+0x284a1;
+                if(adlnObserved)gu603GPUInfoWakeReleaseCaller=address+0x28526;
+
 				for (unsigned i=0;i<arrsize(native);++i)
 					adlnObserved=adlnObserved && patcher.solveSymbol<mach_vm_address_t>(index,native[i].symbol,address,size)==address+offsets[i];
+
+                if(checkKernelArgument("-wex-gu603-infofix")) {
+                    bool ready=adlnObserved && gu603CapturedProfile && size>0x2A7EF &&
+                        checkKernelArgument("-wex-gu603-wakefix");
+                    for(const auto &p:GU603InfoPatch::discarded)
+                        ready=ready && !memcmp(reinterpret_cast<void *>(address+p.offset),p.bytes,sizeof(p.bytes));
+                    for(const auto &p:GU603InfoPatch::inputs)
+                        ready=ready && !memcmp(reinterpret_cast<void *>(address+p.offset),p.bytes,p.size);
+                    const uint8_t capsEntry[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xFB};
+                    ready=ready && patcher.solveSymbol<mach_vm_address_t>(index,
+                        "__ZN16IntelAccelerator16initHardwareCapsEv",address,size)==address+0x2A666 &&
+                        !memcmp(reinterpret_cast<void *>(address+0x2A666),capsEntry,sizeof(capsEntry));
+                    patcher.clearError();
+                    if(ready) {
+                        KernelPatcher::RouteRequest caps {"__ZN16IntelAccelerator16initHardwareCapsEv",gu603NativeCaps,gu603NativeCapsOriginal};
+                        ready=patcher.routeMultiple(index,&caps,1,address,size);
+                    }
+                    for(const auto &p:GU603InfoPatch::discarded)if(ready) {
+                        KernelPatcher::LookupPatch patch {currentGraphics,p.bytes,GU603InfoPatch::nop,sizeof(p.bytes),1};
+                        auto site=reinterpret_cast<uint8_t *>(address+p.offset);
+                        patcher.applyLookupPatch(&patch,site,sizeof(p.bytes)+1);
+                        ready=patcher.getError()==KernelPatcher::Error::NoError &&
+                            !memcmp(site,GU603InfoPatch::nop,sizeof(p.bytes));
+                    }
+                    for(const auto &p:GU603InfoPatch::inputs)
+                        ready=ready && !memcmp(reinterpret_cast<void *>(address+p.offset),p.bytes,p.size);
+                    IORegistryEntry::getRegistryRoot()->setProperty("GU603InfoDiscardReadsSkipped",ready);
+                    os_log(OS_LOG_DEFAULT,"GU603 trial8 discarded-read patch ready=%u\n",ready);
+                    adlnObserved=adlnObserved && ready;
+                }
+
+                if(checkKernelArgument("-wex-gu603-pavpfix")) {
+                    bool ready=adlnObserved && gu603CapturedProfile && checkKernelArgument("-wex-gu603-infofix") &&
+                        size>GU603PAVP::FaultOffset+sizeof(GU603PAVP::Fault) &&
+                        patcher.solveSymbol<mach_vm_address_t>(index,
+                            "__ZN16IntelAccelerator19PAVPCommandCallbackE22PAVPSessionCommandID_tjPjb",address,size)==address+GU603PAVP::EntryOffset;
+                    ready=ready && !memcmp(reinterpret_cast<void *>(address+GU603PAVP::EntryOffset),GU603PAVP::Entry,sizeof(GU603PAVP::Entry)) &&
+                        !memcmp(reinterpret_cast<void *>(address+GU603PAVP::CallOffset),GU603PAVP::Call,sizeof(GU603PAVP::Call)) &&
+                        !memcmp(reinterpret_cast<void *>(address+GU603PAVP::FaultOffset),GU603PAVP::Fault,sizeof(GU603PAVP::Fault)) &&
+                        !memcmp(reinterpret_cast<void *>(address+GU603PAVP::CreationOffset),GU603PAVP::Creation,sizeof(GU603PAVP::Creation));
+                    patcher.clearError();
+                    if(ready) {
+                        gu603PAVPDiscoveryCaller=address+GU603PAVP::DiscoveryReturn;
+                        KernelPatcher::RouteRequest pavp {
+                            "__ZN16IntelAccelerator19PAVPCommandCallbackE22PAVPSessionCommandID_tjPjb",gu603PAVPCallback,gu603PAVPOriginal};
+                        ready=patcher.routeMultiple(index,&pavp,1,address,size);
+                    }
+                    IORegistryEntry::getRegistryRoot()->setProperty("GU603PAVPGuardRouted",ready);
+                    os_log(OS_LOG_DEFAULT,"GU603 trial8 PAVP guard ready=%u\n",ready);
+                    adlnObserved=adlnObserved && ready;
+                }
 				patcher.clearError();
 				adlnObserved=adlnObserved && patcher.routeMultiple(index,native,arrsize(native),address,size);
 				IORegistryEntry::getRegistryRoot()->setProperty("N97NativeObservationsRouted",adlnObserved);
@@ -12089,7 +12398,9 @@ bool XE::wrapFramebufferStart(IOService *that,IOService *provider) {
    return false;
   }
  }
+ if(checkKernelArgument("-wex-gu603-wakefix"))os_log(OS_LOG_DEFAULT,"GU603 trial8 framebuffer start entered Display13=%u\n",s->display13FramebufferRequested);
  const bool native=s->display13FramebufferRequested ? wrapDisplay13FramebufferStart(that,provider) : wrapTGLFramebufferStart(that,provider);
+ if(checkKernelArgument("-wex-gu603-wakefix"))os_log(OS_LOG_DEFAULT,"GU603 trial8 framebuffer start returned %u\n",native);
  IORecursiveLockLock(s->tglPathPoolLock);
  const bool accepted=native && !s->tglLeasesStopping;
  __atomic_store_n(&s->framebufferStartedController,accepted?static_cast<void *>(that):nullptr,__ATOMIC_RELEASE);
@@ -13393,6 +13704,30 @@ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_
     // ADLS_PANEL_PWM_INSTALL_END
    }
 
+   if(tglActive && checkKernelArgument("-wex-gu603-blfix")) {
+    // GU603_BLFIX_ATTRIBUTE_INSTALL: Apple answers the 'bklt' attribute with
+    // kIOReturnUnsupported before reaching hwSetBacklight unless controller+0xE55
+    // is set, so the hwSetBacklight hook above is never called on this panel.
+    // Preflight the exact donor entry (macOS 26.7.2 / 25G332 TGL framebuffer).
+    const char *symbol="__ZN21AppleIntelFramebuffer25setAttributeForConnectionEijm";
+    const char *getSymbol="__ZN21AppleIntelFramebuffer25getAttributeForConnectionEijPm";
+    const uint8_t entry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
+    // push rbp; mov rbp,rsp; push r15,r14,r13,r12,rbx; push rax
+    const uint8_t getEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
+    const auto target=patcher.solveSymbol(index,symbol,address,size);
+    const auto getTarget=patcher.solveSymbol(index,getSymbol,address,size);
+    const bool known=size>0x36200 && target==address+0x352d4 && getTarget==address+0x34692 &&
+     !memcmp(reinterpret_cast<void *>(target),entry,sizeof(entry)) &&
+     !memcmp(reinterpret_cast<void *>(getTarget),getEntry,sizeof(getEntry));
+    KernelPatcher::RouteRequest routes[] {{symbol,wrapGU603SetAttribute,orgGU603SetAttribute},
+     {getSymbol,wrapGU603GetAttribute,orgGU603GetAttribute}};
+    gu603AttributeReady=known && patcher.routeMultiple(index,routes,2,address,size);
+    IORegistryEntry::getRegistryRoot()->setProperty("GU603BacklightAttributeReady",gu603AttributeReady);
+    os_log(OS_LOG_DEFAULT,"GU603 trial13 bklt get/set attribute hooks known=%u ready=%u\n",known,gu603AttributeReady);
+    patcher.clearError();
+    // GU603_BLFIX_ATTRIBUTE_INSTALL_END
+   }
+
 			if (tglActive) {
 				// TGL/Xe-LP has no dedicated eDP transcoder. Keep the allocated
 				// pipe (or getTranscoderOffset's pipe argument), including when
@@ -13549,6 +13884,19 @@ bool XE::adlsCapturePanelPWM(void *controller) {
 }
 uint32_t XE::wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void *timing) {
  auto s=callbackXE;
+ if(GU603Backlight::eligible(checkKernelArgument("-wex-gu603-blfix"),s->xeProfile.identity,s->xeProfile.revision)) {
+  auto c=static_cast<uint8_t *>(controller);
+  if(c) {
+   void *access=*reinterpret_cast<void **>(c+0xC40);
+   if(access && s->orgTGLRegisterRead) {
+    const auto read=[&](unsigned long reg)->uint32_t{
+     return FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,reg);
+    };
+    GU603Backlight::lightUp(controller,access,s->firmwarePorts.panel.pwmHz,read);
+   }
+  }
+  return FunctionCast(wrapADLSLightUpEDP,s->orgADLSLightUpEDP)(controller,fb,path,timing);
+ }
  if(s->display13FramebufferRequested && s->adlnOutputWiring.panel && !display13PanelCapture(controller))return kIOReturnNotReady;
  if(s->adlsDisplaySelected && s->adlsWiring.panel) {
   if(!adlsCapturePanelPWM(controller))return kIOReturnNotReady;
@@ -13560,6 +13908,22 @@ uint32_t XE::wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void 
 }
 uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
  auto s=callbackXE;
+ if(GU603Backlight::eligible(checkKernelArgument("-wex-gu603-blfix"),s->xeProfile.identity,s->xeProfile.revision)) {
+  auto c=static_cast<uint8_t *>(controller);
+  if(c) {
+   void *access=*reinterpret_cast<void **>(c+0xC40);
+   if(access && s->orgTGLRegisterWrite) {
+    const auto read=[&](unsigned long reg)->uint32_t{
+     return s->orgTGLRegisterRead ? FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,reg) : 0U;
+    };
+    const auto write=[&](unsigned long reg,uint32_t val){
+     wrapTGLRegisterWrite(access,reg,val);
+    };
+    return GU603Backlight::setBacklight(controller,access,brightness,s->firmwarePorts.panel.pwmHz,read,write);
+   }
+  }
+  return kIOReturnNotReady;
+ }
  if(s->display13FramebufferRequested && s->adlnOutputWiring.panel)return display13PanelBrightness(controller,brightness);
  if(!s->adlsDisplaySelected || !s->adlsWiring.panel)
   return FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
@@ -13576,8 +13940,87 @@ uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
  }
  f.putPG(power,1);return ready?0:kIOReturnNotReady;
 }
+uint32_t XE::wrapGU603GetAttribute(void *fb,int32_t connectIndex,uint32_t attribute,uintptr_t *value) {
+ auto s=callbackXE;
+ // Native first: when Apple answers (0xE55 set) nothing changes.
+ const uint32_t native=FunctionCast(wrapGU603GetAttribute,s->orgGU603GetAttribute)(fb,connectIndex,attribute,value);
+ if(native==0 || !fb || !value || attribute!=GU603Backlight::kAttributeBKLT)return native;
+ auto f=static_cast<uint8_t *>(fb);
+ auto c=*reinterpret_cast<uint8_t **>(f+0x1D0);
+ const uint32_t fbIndex=*reinterpret_cast<uint32_t *>(f+0x1DC);
+ const uint32_t powerState=*reinterpret_cast<uint32_t *>(f+0x4284);
+ void *access=c?*reinterpret_cast<void **>(c+0xC40):nullptr;
+ const bool eligible=GU603Backlight::eligible(checkKernelArgument("-wex-gu603-blfix"),s->xeProfile.identity,s->xeProfile.revision);
+ if(!GU603Backlight::getterNeedsOverride(eligible,attribute,c!=nullptr,access!=nullptr && s->orgTGLRegisterRead,fbIndex,native))
+  return native;
+ // Current level: stored level, else what the PWM registers say while powered, else full.
+ uint32_t level=*reinterpret_cast<uint32_t *>(c+0xE58);
+ if(powerState==GU603Backlight::kFramebufferPowerOn) {
+  const auto read=[&](unsigned long reg)->uint32_t{
+   return FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,reg);
+  };
+  level=GU603Backlight::levelFromRegisters(read(0xC8254),read(0xC8258),level?level:0xFFFFU);
+ } else if(!level)level=0xFFFFU;
+ GU603Backlight::fillAttribute(value,level);
+ static uint32_t calls;
+ const uint32_t call=__sync_add_and_fetch(&calls,1);
+ // [1, call, native result, native gate byte 0xE55, fb index, power state, level reported]
+ uint32_t receipt[]={1,call,native,c[0xE55],fbIndex,powerState,level};
+ IORegistryEntry::getRegistryRoot()->setProperty("GU603BacklightGet",receipt,sizeof(receipt));
+ if(call<=16)
+  os_log(OS_LOG_DEFAULT,"GU603 trial13 bklt get call=%u native=0x%x gate(0xE55)=%u idx=%u state=%u -> level=%u\n",
+   call,native,c[0xE55],fbIndex,powerState,level);
+ return 0;
+}
+uint32_t XE::wrapGU603SetAttribute(void *fb,int32_t connectIndex,uint32_t attribute,uintptr_t value) {
+ auto s=callbackXE;
+ if(fb && attribute==GU603Backlight::kAttributeBKLT) {
+  auto f=static_cast<uint8_t *>(fb);
+  auto c=*reinterpret_cast<uint8_t **>(f+0x1D0);
+  const uint32_t fbIndex=*reinterpret_cast<uint32_t *>(f+0x1DC);
+  const uint32_t powerState=*reinterpret_cast<uint32_t *>(f+0x4284);
+  void *access=c?*reinterpret_cast<void **>(c+0xC40):nullptr;
+  const bool eligible=GU603Backlight::eligible(checkKernelArgument("-wex-gu603-blfix"),s->xeProfile.identity,s->xeProfile.revision);
+  const auto action=GU603Backlight::attributeAction(eligible,attribute,c!=nullptr,
+   access!=nullptr && s->orgTGLRegisterRead && s->orgTGLRegisterWrite,fbIndex,powerState);
+  uint32_t result=0;
+  if(action==GU603Backlight::AttributeAction::Write) {
+   const auto read=[&](unsigned long reg)->uint32_t{
+    return FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,reg);
+   };
+   const auto write=[&](unsigned long reg,uint32_t val){
+    wrapTGLRegisterWrite(access,reg,val);
+   };
+   result=GU603Backlight::setBacklight(c,access,uint32_t(value),s->firmwarePorts.panel.pwmHz,read,write);
+  } else if(action==GU603Backlight::AttributeAction::Defer) {
+   // Panel not powered: keep the level for Apple's wake-time hwSetBacklight(+0xE58).
+   *reinterpret_cast<uint32_t *>(c+0xE58)=uint32_t(value>65535?65535:value);
+  }
+  if(action!=GU603Backlight::AttributeAction::Native) {
+   // Receipt for ioreg: count, requested level, Apple's native gate byte (+0xE55),
+   // action (1=write,2=defer), fb index, power state and the result.
+   static uint32_t calls;
+   const uint32_t call=__sync_add_and_fetch(&calls,1);
+   uint32_t receipt[]={1,call,uint32_t(value),c?c[0xE55]:0U,
+    action==GU603Backlight::AttributeAction::Write?1U:2U,fbIndex,powerState,result};
+   IORegistryEntry::getRegistryRoot()->setProperty("GU603BacklightAttribute",receipt,sizeof(receipt));
+   if(call<=16 || (call%64)==0)
+    os_log(OS_LOG_DEFAULT,"GU603 trial13 bklt call=%u level=%lu native-gate(0xE55)=%u action=%u idx=%u state=%u result=0x%x\n",
+     call,static_cast<unsigned long>(value),c?c[0xE55]:0U,action==GU603Backlight::AttributeAction::Write?1U:2U,fbIndex,powerState,result);
+   return result;
+  }
+ }
+ return FunctionCast(wrapGU603SetAttribute,s->orgGU603SetAttribute)(fb,connectIndex,attribute,value);
+}
 void XE::wrapADLSPanelPWMEnable(void *access) {
  auto s=callbackXE;
+ if(GU603Backlight::eligible(checkKernelArgument("-wex-gu603-blfix"),s->xeProfile.identity,s->xeProfile.revision)) {
+  const auto write=[&](unsigned long reg,uint32_t val){
+   wrapTGLRegisterWrite(access,reg,val);
+  };
+  GU603Backlight::enablePWM(access,write);
+  return;
+ }
  if(s->display13FramebufferRequested){display13PanelPWMEnable(access);return;}uint32_t value=0x80000000;
  if(s->adlsDisplaySelected && s->adlsWiring.panel) {
   void *expected,*power;
@@ -14032,7 +14475,12 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	// The current kernel personality uses 0x1080040, rejected by AppleGVA before
 	// AVD_CreateAVDAccelerator. The paired TGL VA donor returns 0x1080080.
 	// Align this registry identity only; keep the real PCI ID and TGL bundle.
-	if (auto renderer = OSDynamicCast(OSNumber, that->getProperty("IOVARendererID"))) {
+	auto mediaPCI=OSDynamicCast(IOPCIDevice,provider);
+	const bool mediaBlocked=mediaPCI && GU603Media::scope(checkKernelArgument("-wex-gu603-media-guard"),
+	    gu603CapturedProfile,mediaPCI->configRead32(0),mediaPCI->configRead8(8));
+	if(mediaBlocked && !gu603MediaGuardReady)return false;
+	if(mediaBlocked)GU603Media::withdraw(that);
+	if (!mediaBlocked)if (auto renderer = OSDynamicCast(OSNumber, that->getProperty("IOVARendererID"))) {
 		if (renderer->unsigned32BitValue() == 0x1080040)
 			that->setProperty("IOVARendererID", 0x1080080, 32);
 	}
@@ -14041,7 +14489,7 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	// to the per-profile capability dictionary. The TGL personality has the
 	// dictionary but omits the key; use the paired ICL host's registration value.
 	// This exposes decode only and does not invent additional profile support.
-	if (!that->getProperty("IOGVAHEVCDecode") &&
+	if (!mediaBlocked && !that->getProperty("IOGVAHEVCDecode") &&
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
 
@@ -14068,6 +14516,11 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	tglObserveAccelerator(that, 2, false, 0, reinterpret_cast<uintptr_t>(provider));
 	SYSLOG("igfx", "TGL accelerator start entered");
 	bool result = FunctionCast(wrapTGLAcceleratorStart, callbackXE->orgTGLAcceleratorStart)(that, provider);
+	if(mediaBlocked) {
+	    GU603Media::withdraw(that);
+	    that->setProperty("GU603HardwareVideoUnavailable",true);
+	    os_log(OS_LOG_DEFAULT,"GU603 trial8 video admission removed; native accelerator start=%u",result);
+	}
 	if (result) IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSAtStart",
 		*reinterpret_cast<uint8_t *>(reinterpret_cast<uint8_t *>(that)+0x1474),32);
 	if (tglHost.owner==that) {
@@ -14320,12 +14773,32 @@ bool XE::configureAlderLakeNWithGT(IOService *that, IOPCIDevice *provider, IOMem
 	root->setProperty("N97MemoryFWHeld",held,sizeof(held));
 	root->setProperty("N97MemoryFWAcquired",awake);
 	bool result=false;
+    const bool gu603Trial = checkKernelArgument("-wex-gu603-wakefix") &&
+        provider && provider->configRead32(0)==0xA7A88086U && provider->configRead8(8)==4;
+    const bool gu603Scope = gu603Trial && awake && requested==3 && !gu603ConfigureWake.active;
+    if(gu603Scope) {
+        gu603ConfigureWake={};gu603ConfigureWake.owner=that;
+        gu603ConfigureWake.thread=reinterpret_cast<uintptr_t>(current_thread());
+        gu603ConfigureWake.base=base;gu603ConfigureWake.physical=map->getPhysicalAddress();
+        gu603ConfigureWake.baseline[0]=before[0];gu603ConfigureWake.baseline[1]=before[2];
+        __atomic_store_n(&gu603ConfigureWake.active,true,__ATOMIC_RELEASE);
+        os_log(OS_LOG_DEFAULT,"GU603 trial8 configure lease acquired GT=%x RENDER=%x\n",held[0],held[1]);
+    }
 	if (awake) {
 	 root->setProperty("N97MemoryConfigureEntered",true);
 	 result=FunctionCast(wrapAlderLakeNConfigureDevice,callbackXE->orgAlderLakeNConfigureDevice)(that,provider);
 	 root->setProperty("N97MemoryConfigureReturned",true);
 	 root->setProperty("N97MemoryConfigureResult",result);
 	}
+    if(gu603Scope) {
+        const auto a=reinterpret_cast<const uint8_t *>(that);
+        const uint32_t eu=Display13FBMemory::field<uint32_t>(a,0x1124);
+        const uint32_t l3=Display13FBMemory::field<uint32_t>(a,0x1164);
+        result=result && !gu603ConfigureWake.failed && gu603ConfigureWake.observations==1 && eu==64 && l3==6;
+        os_log(OS_LOG_DEFAULT,"GU603 trial8 configure returned native/caps=%u failed=%u samples=%u EU=%u L3=%u\n",
+            result,gu603ConfigureWake.failed,gu603ConfigureWake.observations,eu,l3);
+        __atomic_store_n(&gu603ConfigureWake.active,false,__ATOMIC_RELEASE);
+    }
 	released=true;
 	for (int d=1;d>=0;--d) if (requested&(1U<<d)) {
 	 write(request[d],0x00010000);
@@ -14333,7 +14806,42 @@ bool XE::configureAlderLakeNWithGT(IOService *that, IOPCIDevice *provider, IOMem
 	}
 	root->setProperty("N97MemoryFWAfter",after,sizeof(after));
 	root->setProperty("N97MemoryFWReleased",released);
+    if(gu603Trial)os_log(OS_LOG_DEFAULT,"GU603 trial8 configure cleanup released=%u result=%u\n",released,result);
 	return result;
+}
+
+static void gu603ObserveAfterWake(void *owner,bool enable,unsigned domains,uintptr_t caller) {
+ auto &scope=gu603ConfigureWake;
+ if(!__atomic_load_n(&scope.active,__ATOMIC_ACQUIRE) || owner!=scope.owner || domains!=5 ||
+    scope.thread!=reinterpret_cast<uintptr_t>(current_thread()))return;
+ if(!enable && caller==gu603GPUInfoWakeReleaseCaller) {
+    os_log(OS_LOG_DEFAULT,"GU603 trial8 GPUInfo native read block returned\n");
+    return;
+ }
+ if(!enable || caller!=gu603GPUInfoWakeCaller)return;
+ ++scope.observations;
+ auto a=static_cast<uint8_t *>(owner);
+ auto manager=Display13FBMemory::field<OSObject *>(a,0x1260);
+ const auto nativeBase=Display13FBMemory::field<volatile uint8_t *>(a,0x1240);
+ IOMemoryMap *nativeMap=nullptr;
+ if(manager && manager->getMetaClass()->getClassSize()>=0x70)
+    nativeMap=OSDynamicCast(IOMemoryMap,Display13FBMemory::field<OSObject *>(manager,0x68));
+ const uint32_t mode=Display13FBMemory::field<uint32_t>(a,0x1190);
+ const bool mapped=nativeMap && nativeBase && nativeMap->getVirtualAddress()==reinterpret_cast<uintptr_t>(nativeBase) &&
+    nativeMap->getLength()==0x1000000 && nativeMap->getPhysicalAddress()==scope.physical;
+ const bool qualified=mapped && !(mode&0x1800) && scope.observations==1 && scope.base;
+ struct IO {
+    volatile uint8_t *base;
+    uint32_t read(uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(base+reg);}
+    void write(uint32_t reg,uint32_t value) {*reinterpret_cast<volatile uint32_t *>(base+reg)=value;read(reg);}
+    void delay(){IODelay(100);}
+ } io {nativeBase};
+ auto receipt=GU603WakeScope::ensure(io,qualified,scope.baseline);
+ scope.failed=scope.failed || receipt.status!=GU603WakeScope::Status::Complete;
+ IORegistryEntry::getRegistryRoot()->setProperty("GU603WakeScopeReceipt",&receipt,sizeof(receipt));
+ os_log(OS_LOG_DEFAULT,"GU603 trial8 wake maps=%u mode=%x status=%u restored=%x GT=%x/%x RENDER=%x/%x fuses=%x,%x,%x,%x,%x\n",
+    mapped,mode,unsigned(receipt.status),receipt.restoredMask,receipt.request[0],receipt.ack[0],
+    receipt.request[1],receipt.ack[1],receipt.fuses[0],receipt.fuses[1],receipt.fuses[2],receipt.fuses[3],receipt.fuses[4]);
 }
 
 void XE::wrapTGLAcceleratorStop(IOService *that,IOService *provider) {
@@ -14512,6 +15020,12 @@ void XE::wrapAlderLakeNNativeGPUInfo(IOService *that) {
 	const uint64_t profile=uint64_t(*reinterpret_cast<uint32_t *>(a+0x1124))<<32 |
 		*reinterpret_cast<uint32_t *>(a+0x1164);
 	tglObserveAccelerator(that,8,true,profile,*reinterpret_cast<uint32_t *>(a+0x1190));
+    if(checkKernelArgument("-wex-gu603-wakefix"))
+        os_log(OS_LOG_DEFAULT,"GU603 trial8 GPUInfo sku=%u EU=%u SS=%u slices=%u L3=%u flags=%x engines=%llx\n",
+            Display13FBMemory::field<uint32_t>(a,0x1120),Display13FBMemory::field<uint32_t>(a,0x1124),
+            Display13FBMemory::field<uint32_t>(a,0x1158),Display13FBMemory::field<uint32_t>(a,0x115c),
+            Display13FBMemory::field<uint32_t>(a,0x1164),Display13FBMemory::field<uint32_t>(a,0x1190),
+            Display13FBMemory::field<uint64_t>(a,0x1300));
 }
 
 bool XE::wrapAlderLakeNNativeIRQ(IOService *that) {
@@ -14522,6 +15036,7 @@ bool XE::wrapAlderLakeNNativeIRQ(IOService *that) {
 }
 
 bool XE::wrapTGLAcceleratorEngine(IOService *that) {
+ if(checkKernelArgument("-wex-gu603-edpkeep"))os_log(OS_LOG_DEFAULT,"GU603 trial8 render engine start entered\n");
  if (callbackXE->adlnDetected) {
   auto a=reinterpret_cast<uint8_t *>(that);
   uint32_t caps[] {*reinterpret_cast<uint32_t *>(a+0x1120),*reinterpret_cast<uint32_t *>(a+0x1124),
@@ -14589,6 +15104,8 @@ bool XE::wrapTGLAcceleratorEngine(IOService *that) {
  auto irq=tglFBIRQBegin(3,callbackXE->tglObservationController,0,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 	tglObserveAccelerator(that, 6, false, 0, 0);
 	const bool result = FunctionCast(wrapTGLAcceleratorEngine, callbackXE->orgTGLAcceleratorEngine)(that);
+ if(checkKernelArgument("-wex-gu603-edpkeep"))os_log(OS_LOG_DEFAULT,"GU603 trial8 render engine start returned=%u\n",result);
+
 	tglObserveAccelerator(that, 6, true, result, 0);
 	tglFBIRQEnd(irq,result);
 	if (tglHost.owner==that) tglHostPublish();
@@ -14696,11 +15213,13 @@ mach_vm_address_t xelpRegularForceWakeOriginal {};
 // >=100us, >=1ms, bypass, total native ns, >=10ms. No MMIO from readers.
 static uint64_t xelpForceWakeIRQ[9] {};
 void xelpRegularForceWakeProtected(void *owner,bool enable,unsigned domains) {
+ const auto gu603Caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
  uint64_t flags=0;
  if(owner)memcpy(&flags,static_cast<uint8_t *>(owner)+0x1190,sizeof(flags));
  if(!owner || !XELPForceWakeIRQ::required(flags,domains)) {
   __atomic_fetch_add(&xelpForceWakeIRQ[6],1ULL,__ATOMIC_RELAXED);
   reinterpret_cast<TGLCSBForceWake>(xelpRegularForceWakeOriginal)(owner,enable,domains);
+  gu603ObserveAfterWake(owner,enable,domains,gu603Caller);
   return;
  }
  // Protect every regular caller, including telemetry interrupted by IRQ submit.
@@ -14719,6 +15238,7 @@ void xelpRegularForceWakeProtected(void *owner,bool enable,unsigned domains) {
   __atomic_fetch_add(&xelpForceWakeIRQ[8],ns>=10000000,__ATOMIC_RELAXED);
  });
  if(!prior)__atomic_fetch_add(&xelpForceWakeIRQ[1],1ULL,__ATOMIC_RELAXED);
+ gu603ObserveAfterWake(owner,enable,domains,gu603Caller);
 }
 bool xelpForceWakeIRQSerialize(void *,void *,OSSerialize *serializer) {
  uint64_t q[10] {1};
